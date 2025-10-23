@@ -1,0 +1,26 @@
+[
+{
+  "directory": "/home/chaitu/Desktop/vscode/MyTerminal/build",
+  "command": "/usr/bin/g++  -I/home/chaitu/Desktop/vscode/MyTerminal/include -g -std=gnu++17 -o CMakeFiles/terminal_gui.dir/src/gui/TerminalWindow.cpp.o -c /home/chaitu/Desktop/vscode/MyTerminal/src/gui/TerminalWindow.cpp",
+  "file": "/home/chaitu/Desktop/vscode/MyTerminal/src/gui/TerminalWindow.cpp",
+  "output": "CMakeFiles/terminal_gui.dir/src/gui/TerminalWindow.cpp.o"
+},
+{
+  "directory": "/home/chaitu/Desktop/vscode/MyTerminal/build",
+  "command": "/usr/bin/g++  -I/home/chaitu/Desktop/vscode/MyTerminal/include -g -std=gnu++17 -o CMakeFiles/terminal_gui.dir/src/gui/Tab.cpp.o -c /home/chaitu/Desktop/vscode/MyTerminal/src/gui/Tab.cpp",
+  "file": "/home/chaitu/Desktop/vscode/MyTerminal/src/gui/Tab.cpp",
+  "output": "CMakeFiles/terminal_gui.dir/src/gui/Tab.cpp.o"
+},
+{
+  "directory": "/home/chaitu/Desktop/vscode/MyTerminal/build",
+  "command": "/usr/bin/g++  -I/home/chaitu/Desktop/vscode/MyTerminal/include -g -std=gnu++17 -o CMakeFiles/terminal_gui.dir/src/core/History.cpp.o -c /home/chaitu/Desktop/vscode/MyTerminal/src/core/History.cpp",
+  "file": "/home/chaitu/Desktop/vscode/MyTerminal/src/core/History.cpp",
+  "output": "CMakeFiles/terminal_gui.dir/src/core/History.cpp.o"
+},
+{
+  "directory": "/home/chaitu/Desktop/vscode/MyTerminal/build",
+  "command": "/usr/bin/g++  -I/home/chaitu/Desktop/vscode/MyTerminal/include -g -std=gnu++17 -o CMakeFiles/myshell.dir/src/app/main.cpp.o -c /home/chaitu/Desktop/vscode/MyTerminal/src/app/main.cpp",
+  "file": "/home/chaitu/Desktop/vscode/MyTerminal/src/app/main.cpp",
+  "output": "CMakeFiles/myshell.dir/src/app/main.cpp.o"
+}
+]

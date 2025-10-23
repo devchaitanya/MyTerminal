@@ -1,0 +1,560 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codeborder}{RGB}{220,220,220}
+\lstdefinestyle{code}{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  frame=single,
+  rulecolor=\color{codeborder},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\title{MyTerminal Design Document}
+\author{MyTerminal Team}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+MyTerminal is a lightweight graphical terminal application implemented with X11/Xlib, optionally accelerated by Pango/Cairo for robust UTF-8 rendering. It provides a shell-like environment supporting pipelines, redirections, history, tabs, background jobs, and a custom \texttt{multiWatch} command that executes multiple commands in parallel and streams their outputs with timestamps. This document details the architecture, components, execution model, data flows, and key design decisions.
+\end{abstract}
+
+\tableofcontents
+
+\section{Overview}
+MyTerminal combines a minimal graphical terminal UI with a shell runner:
+\begin{itemize}[leftmargin=*]
+  \item X11-based windowing, custom rendering and input handling
+  \item Command execution via fork/exec with pipes or PTY when interactive
+  \item Persistent command history, search, and basic autocompletion
+  \item Tabs with independent job state
+  \item Background job support
+  \item \textbf{multiWatch}: run N commands in parallel per period; stream outputs with UNIX timestamps and per-command headers; clean up on interrupt/exit
+\end{itemize}
+
+\section{Repository Structure}
+\begin{itemize}[leftmargin=*]
+  \item \texttt{include/}
+    \begin{itemize}
+      \item \texttt{gui/TerminalWindow.hpp}: Main app class and public methods
+      \item \texttt{gui/Tab.hpp}: Per-tab UI and execution state
+      \item \texttt{core/History.hpp}: History model with persistence and search
+    \end{itemize}
+  \item \texttt{src/}
+    \begin{itemize}
+      \item \texttt{gui/TerminalWindow.cpp}: X11 window, event loop, drawing, input, scheduling
+      \item \texttt{gui/Tab.cpp}: Text rendering helpers and small utilities
+      \item \texttt{core/CommandExecutor.cpp}: Command parsing, built-ins, pipelines, processes, multiWatch, jobs
+      \item \texttt{core/History.cpp}: History implementation
+      \item \texttt{app/main.cpp}: Program entry (includes exit-time sweeper)
+    \end{itemize}
+  \item \texttt{Makefile}, \texttt{Makefile.nopango}, \texttt{CMakeLists.txt}: Build scripts (Makefile uses Pango/Cairo; Makefile.nopango disables Pango/Cairo; CMake toggles via \texttt{USE\_PANGO\_CAIRO}=ON|OFF)
+  \item \texttt{temp/}: Runtime temporary FIFOs used by \texttt{multiWatch}
+\end{itemize}
+
+\section{Requirements}
+\subsection{Functional}
+\begin{itemize}[leftmargin=*]
+  \item Execute arbitrary commands, including pipelines (\verb!cmd1 | cmd2!), with redirection (\verb!>!, \verb!<!, \verb!2>!).
+  \item Maintain persistent command history (load at startup, append on every command) and provide inline search (Ctrl+R).
+  \item Provide basic autocomplete for built-in commands, external executables, and file/directory paths via Tab key.
+  \item Support multiline unicode input, handling characters from various languages and preserving encoding in display.
+  \item Provide line navigation shortcuts: Ctrl+A to move cursor to the beginning of the line, Ctrl+E to the end.
+  \item Support multi-line input via unmatched quotes and line-continuation (trailing \verb!\!); treat it as a single logical command.
+  \item Support multiple commands in one submission (newline-separated or semicolon-separated outside quotes) and execute them sequentially.
+  \item Provide background detaching via Ctrl+Z; continue to drain and print background output. The '&' operator is not supported.
+  \item Provide a custom \texttt{multiWatch} command that:
+    \begin{itemize}
+      \item Executes N commands in parallel for each period.
+      \item Creates a hidden temporary FIFO per child using the child's real PID: \verb!temp/.temp.<PID>.txt!.
+      \item Reads all child outputs via \texttt{poll()} over those FIFO descriptors and streams output as it arrives.
+      \item Prints per-command headers with UNIX timestamp and separator framing.
+      \item Cleans up on Ctrl+C: terminate cycle children, unlink all FIFOs, exit worker; restore scrollback in UI.
+      \item Removes lingering temp files when the shell closes (\texttt{atexit} sweep) and also sweeps on worker startup.
+    \end{itemize}
+  \item Render ANSI-colored output; optionally use Pango/Cairo for robust UTF-8 shaping.
+  \item Provide tabs and basic UI affordances (scrollbar, prompt, separators between pasted commands).
+\end{itemize}
+
+\subsection{Non-Functional}
+\begin{itemize}[leftmargin=*]
+  \item Linux/X11 environment; C++17.
+  \item Single-process GUI (no threads) with nonblocking I/O to keep UI responsive.
+  \item Clean failure modes: if exec fails, report errors; avoid orphaned FIFOs; sweep temp directory on exit/start.
+  \item Reasonable performance for typical command output and up to dozens of \texttt{multiWatch} commands.
+\end{itemize}
+
+\section{Architecture}
+\subsection{High-Level Components}
+\begin{description}
+  \item[TerminalWindow] X11 window, event loop, input handling, command scheduling, rendering pipeline.
+  \item[Tab] Per-tab state: buffers, job descriptors, queues, continuation state, multiWatch snapshot.
+  \item[Command Execution] Parser + launcher for built-ins, pipelines, PTY selection, and process I/O wiring.
+  \item[multiWatch Worker] A forked child that orchestrates per-period parallel children and streams via FIFOs.
+  \item[History] Persistent store for commands; search and best-match suggestions.
+\end{description}
+
+\subsection{Event Loop and Scheduling}
+\begin{itemize}[leftmargin=*]
+  \item The X11 loop handles input events (KeyPress, Mouse), periodic repaint ticks, and file-descriptor polling for child output.
+  \item \texttt{runNextCommand()} dequeues and dispatches commands sequentially; built-ins return quickly and chain to next; external commands advance when reaped.
+  \item Between commands from a pasted batch, a visible separator line is printed to avoid output confusion.
+\end{itemize}
+
+\subsection{Data Flow (typical external command)}
+\begin{enumerate}[leftmargin=*]
+  \item User submits text; it is split into logical commands while respecting quotes and semicolons.
+  \item A command is parsed into pipeline stages with redirections.
+  \item The process tree is forked; pipes/PTY are wired.
+  \item Parent monitors nonblocking read ends; chunks are appended to \texttt{scrollback} after ANSI processing.
+  \item On EOF and successful \texttt{waitpid()}, scheduling advances.
+\end{enumerate}
+
+\subsection{TerminalWindow}
+Primary UI controller (see \texttt{TerminalWindow.hpp}):
+\begin{itemize}[leftmargin=*]
+  \item X11 setup, event loop, drawing: tab bar, text area, scrollbar
+  \item Input handling: UTF-8 IME (XIM/XIC), line editing, history search (Ctrl+R), autocomplete
+  \item Command submission and scheduling across \texttt{Tab::pendingCmds}
+  \item Process I/O pump: nonblocking read from child stdout/stderr; background drains
+  \item Prompting and transcript building with simple ANSI parsing and coloring
+  \item Optional Pango/Cairo rendering for multilingual text
+\end{itemize}
+
+\subsection{Tab}
+Per-tab state container (\texttt{Tab.hpp}):
+\begin{itemize}[leftmargin=*]
+  \item Text buffers: \texttt{scrollback}, \texttt{input}
+  \item Cursor and scrolling metrics
+  \item Foreground job: \texttt{childPid}, \texttt{childPgid}, and FDs
+  \item Background jobs: list of \texttt{BackgroundJob}
+  \item Continuation state for multi-line commands (quotes/backslashes)
+  \item Queue: \texttt{pendingCmds} for sequential execution
+  \item multiWatch session flag and saved scrollback snapshot
+\end{itemize}
+
+\section{Detailed Algorithms}
+\subsection{Splitting Lines and Commands}
+\paragraph{Split by newline respecting quotes.} We walk bytes and toggle flags \texttt{inS/inD} for single/double quotes. Newlines outside quotes delimit commands. Whitespace-only fragments are discarded.
+\begin{lstlisting}[style=code]
+inS=false, inD=false, cur=""
+for c in input:
+  if c=='"' && !inS: inD=!inD; cur+=c; continue
+  if c=='\'' && !inD: inS=!inS; cur+=c; continue
+  if c=='\n' && !inS && !inD: push(cur if non-empty non-whitespace); cur=""; continue
+  cur+=c
+push(cur if non-empty non-whitespace)
+\end{lstlisting}
+
+\paragraph{Split by semicolon respecting quotes.} Applied per logical line for sequences like \verb!cmd1; cmd2!.
+
+\subsection{Pipelines and Redirections}
+\begin{enumerate}[leftmargin=*]
+  \item Parse stages, and within each stage, extract redirections for stdin/stdout/stderr.
+  \item Create N-1 pipes for an N-stage pipeline.
+  \item For single-stage with no redirection, attempt PTY for interactive behavior; else use pipes.
+  \item Child i: dup2 appropriate fds (stdin from prev pipe or file; stdout to next pipe or parent outPipe; stderr to errPipe unless redirected).
+  \item Close unused fds in children and parent; parent sets nonblocking on read ends.
+\end{enumerate}
+
+\subsection{multiWatch Worker Loop}
+\paragraph{Rationale for FIFOs over regular files.} Regular files are always readable by \texttt{poll()}, making readiness semantics unhelpful. FIFOs support readiness and EOF/HUP, enabling true streaming.
+
+\paragraph{Per period algorithm.}
+\begin{lstlisting}[style=code]
+// At worker startup: sweep temp/.temp.*.txt (orphan cleanup)
+loop forever:
+  clear mw_pids, mw_tempfiles
+  mkdir("temp", 0755)
+  // Spawn N children
+  for i in 0..N-1:
+    p = fork()
+    if child:
+      tf = "temp/.temp." + getpid() + ".txt"
+      // Nonblocking open loop until reader is up
+      while ( (wfd=open(tf, O_WRONLY|O_NONBLOCK))<0 ) sleep 10ms
+      dup2(wfd, 1); dup2(wfd, 2); close(wfd)
+      execlp("sh","sh","-c",cmd[i],NULL)
+      _exit(127)
+    else:
+      tf = "temp/.temp." + p + ".txt"; unlink(tf); mkfifo(tf,0644)
+      rfd = retry open(tf, O_RDONLY|O_NONBLOCK)
+      pfds.push({fd:rfd, events:POLLIN|POLLHUP|POLLERR}); map pfds->cmdIndex
+
+  // Stream with poll
+  headerPrinted[j]=false; trailerPrinted[j]=false
+  while openCount>0:
+    poll(pfds, 200ms)
+    for each j with revents:
+      if POLLIN: read; on first bytes print header+separator; write chunk
+      if read==0 or POLLHUP/ERR: drain; ensure trailing separator; close+unlink fifo; openCount--
+
+  // Reap children and record exit codes (optional); sleep interval seconds
+\end{lstlisting}
+
+\paragraph{Header/Separator Formatting.}
+On first data (or EOF without data) for a given command in the period, print:
+\begin{lstlisting}[style=code]
+"<cmd>" , current_time: <unix_timestamp> :
+----------------------------------------------------
+<data if any>
+----------------------------------------------------
+\end{lstlisting}
+The dashed line count is constant in code and can be tuned; a separate, longer dashed line is used between queued commands from pasted input.
+
+\subsection{Cleanup Strategy}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Per-stream}: On EOF/HUP, close the FIFO and immediately \texttt{unlink()} it.
+  \item \textbf{On signals}: SIGINT/TERM/HUP/QUIT handled by the worker: kill cycle PIDs, unlink all \texttt{mw\_tempfiles}, exit.
+  \item \textbf{On worker startup}: Sweep \texttt{temp/.temp.*.txt} via glob and unlink.
+  \item \textbf{On app exit}: \texttt{atexit} sweep in \texttt{main.cpp} unlinks lingering \texttt{temp/.temp.*.txt}.
+\end{itemize}
+
+\subsection{Signals and Process Groups}
+\begin{itemize}[leftmargin=*]
+  \item Foreground jobs form a process group; Ctrl+C sends SIGINT via \texttt{killpg}.
+  \item multiWatch worker sets its own PGID so Ctrl+C targets the whole watch job.
+\end{itemize}
+
+\section{Execution Model}
+\subsection{Command Submission and Scheduling}
+\begin{enumerate}[leftmargin=*]
+\item The user enters a line; MyTerminal echoes the prompt and line.
+\item The input may contain:
+  \begin{itemize}
+    \item Multiple commands separated by newlines or semicolons (outside quotes)
+    \item Continuation lines for unmatched quotes or line-continuation backslashes
+  \end{itemize}
+\item Parsed commands are enqueued into \texttt{Tab::pendingCmds}.
+\item \texttt{runNextCommand()} dequeues and dispatches one at a time:
+  \begin{itemize}
+    \item Built-ins execute synchronously and now call \texttt{runNextCommand()} when done.
+    \item External programs launch via fork/exec. Completion is detected through nonblocking I/O pump and \texttt{waitpid()} (WNOHANG); then \texttt{runNextCommand()} continues.
+  \end{itemize}
+\item For clarity with multi-command pastes, a visual separator line is printed between commands.
+\end{enumerate}
+
+\subsection{Pipelines and Redirection}
+In \texttt{CommandExecutor.cpp}, pipelines are parsed into stages. For each stage:
+\begin{itemize}[leftmargin=*]
+  \item FDs are wired via pipes; redirections for in/out/err are respected
+  \item The last stage's stdout/stderr are attached to the UI
+  \item PTY mode is used for single-stage interactive commands (TTY-friendly behavior); otherwise, pipes are used
+\end{itemize}
+
+\subsection{Background Jobs}
+Ctrl+Z detaches the current foreground job; output is drained and appended to the transcript. The \texttt{\&} operator is not supported. Jobs are tracked with PID/PGID and FDs.
+
+\section{UI/UX Details}
+\begin{itemize}[leftmargin=*]
+  \item Prompt format: \verb!user@host:cwd$ !; colored segments for readability.
+  \item Continuations show \verb!> ! prefix; transcript preserves exact typed content (excluding continuation backslashes).
+  \item Between commands in a multi-command submission, a long separator line is printed: \verb!-------------------------------------------------------------!.
+  \item ANSI parsing tracks ESC/CSI states and applies color/intensity where feasible.
+\end{itemize}
+
+\section{Input, Editing, and History}
+\begin{itemize}[leftmargin=*]
+  \item Line editing supports basic input; Ctrl+A (start of line) and Ctrl+E (end of line).
+  \item Continuation with unmatched quotes and \texttt{\textbackslash} line-joins retains logical command structure
+  \item History is persisted and deduplicated for consecutive identical entries
+  \item Autocomplete lists choices and supports directory-prefix-aware replacements
+\end{itemize}
+(\texttt{History.hpp/.cpp}) Persistent ring with:
+\begin{itemize}[leftmargin=*]
+  \item Append, clear, save/load to \texttt{\textasciitilde/.myterm\_history}
+  \item Search with exact and substring strategies
+  \item Best-match suggestions for autocomplete
+\end{itemize}
+
+\section{Rendering}
+\begin{itemize}[leftmargin=*]
+  \item Xlib text drawing with ANSI color approximation; optional Pango/Cairo rendering for true UTF-8 shaping
+  \item Custom scrollback and scrollbar; 60 Hz redraw loop for smoothness
+  \item Prompt coloring (user/host/cwd) with theme-able palette
+\end{itemize}
+
+\section{multiWatch Design}
+\subsection{Goals}
+\begin{itemize}[leftmargin=*]
+  \item Run multiple commands \emph{in parallel} each period
+  \item Stream outputs intermixed as data is available, not after completion
+  \item Tag each stream with command and UNIX timestamp
+  \item Clean up cleanly on Ctrl+C and when the shell exits
+\end{itemize}
+
+\subsection{Overview}
+\begin{enumerate}[leftmargin=*]
+\item The shell forks a \textbf{multiWatch worker} process.
+\item Each period, the worker:
+  \begin{enumerate}
+    \item Forks N children; each child writes to a FIFO at \texttt{temp/.temp.\textless PID\textgreater.txt} (one per command).
+    \item The worker opens nonblocking read-ends for all FIFOs and uses \texttt{poll()} to multiplex.
+    \item As data arrives, it prints:
+      \begin{itemize}
+        \item Header: \texttt{"cmd" , current\_time: <unix\_timestamp> :}
+        \item Separator line: 56 dashes (as configured)
+        \item Raw command output (may be empty)
+        \item Trailing separator line
+      \end{itemize}
+    \item On EOF/HUP for a FIFO, the worker closes and unlinks that FIFO.
+    \item After all commands finish, the worker sleeps for the configured interval and repeats.
+  \end{enumerate}
+\item Ctrl+C kills the worker's process group; the worker's signal handler then:
+  \begin{itemize}
+    \item Kills all child PIDs for the current cycle
+    \item Unlinks any FIFOs it knows about
+    \item Exits
+  \end{itemize}
+\item The parent (GUI) reads the worker's stdout and paints the transcript; upon worker exit, it restores the scrollback that was present before multiWatch started.
+\end{enumerate}
+
+\subsection{File/Descriptor Strategy}
+The design uses \textbf{FIFOs} for each child invocation:
+\begin{itemize}[leftmargin=*]
+  \item Satisfies requirement to create hidden temp files named with the real PID
+  \item Enables true nonblocking multiplexing with \texttt{poll()} over read descriptors
+  \item Files are short-lived: unlinked as soon as the corresponding child completes
+\end{itemize}
+A sweep is performed at worker startup and at shell exit (via \texttt{atexit}) to remove stale entries in \texttt{temp/}.
+
+\subsection{Interrupts and Lifecycle}
+\begin{itemize}[leftmargin=*]
+  \item Signals handled: SIGINT, SIGTERM, SIGHUP, SIGQUIT
+  \item On Ctrl+C: terminate cycle children; unlink FIFOs; exit worker; GUI restores previous scrollback
+  \item On shell close: atexit sweep removes lingering \texttt{temp/.temp.*.txt}
+\end{itemize}
+
+\subsection{Formatting}
+Per command per cycle:
+\begin{lstlisting}[style=code]
+"cmd" , current_time: 1690000000 :
+----------------------------------------------------
+<Output>
+----------------------------------------------------
+\end{lstlisting}
+Repeat for each command, and then each cycle.
+
+\section{Commands and Shortcuts}
+\subsection{Built-in Commands}
+The shell supports the following built-in commands, which are handled internally without forking external processes:
+
+\begin{description}
+  \item[multiWatch] \hfill \\
+    Syntax: \texttt{multiWatch [interval] ["cmd1", "cmd2", ...]} or \texttt{multiWatch [interval] cmd1 cmd2 ...} \\
+    Runs multiple commands in parallel each period, streaming outputs with headers and timestamps. Interval defaults to 5 seconds if omitted. \\
+    Example: \texttt{multiWatch 10 ["date", "uptime"]} \\
+    Feature: multiWatch (parallel monitoring)
+
+  \item[bgpids] \hfill \\
+    Syntax: \texttt{bgpids} \\
+    Lists all active background job PIDs with their command names. \\
+    Feature: Background Jobs
+
+  \item[killprocess] \hfill \\
+    Syntax: \texttt{killprocess [-9] PID [PID ...]} \\
+    Sends SIGTERM (or SIGKILL if -9) to the specified PIDs. \\
+    Example: \texttt{killprocess 1234} \\
+    Feature: Background Jobs (use Ctrl+Z to detach a running foreground job; '&' is not supported)
+
+  \item[echo] \hfill \\
+    Syntax: \texttt{echo [args ...]} \\
+    Prints arguments to stdout, separated by spaces. \\
+    Feature: Command Execution
+
+  \item[history] \hfill \\
+    Syntax: \texttt{history} or \texttt{history clear} \\
+    Shows command history; \texttt{clear} removes all history. \\
+    Feature: History
+
+  \item[cd] \hfill \\
+    Syntax: \texttt{cd [directory]} \\
+    Changes current working directory; defaults to home if no argument. \\
+    Feature: Command Execution
+
+  \item[clear] \hfill \\
+    Syntax: \texttt{clear} \\
+    Clears the terminal screen. \\
+    Feature: UI/UX
+
+  \item[pwd] \hfill \\
+    Syntax: \texttt{pwd} \\
+    Prints the current working directory. \\
+    Feature: Command Execution (implied in prompt)
+\end{description}
+
+\subsection{Keyboard Shortcuts}
+The following keyboard shortcuts are supported for input editing and control:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Ctrl+C}: Interrupt the current foreground command (sends SIGINT to process group).
+  \item \textbf{Ctrl+Z}: Send the current foreground command to background (detaches job).
+  \item \textbf{Ctrl+A}: Move cursor to the beginning of the line.
+  \item \textbf{Ctrl+E}: Move cursor to the end of the line.
+  \item \textbf{Ctrl+R}: Search backward in command history.
+  \item \textbf{Arrow Keys}: Navigate cursor left/right.
+  \item \textbf{Backspace/Delete}: Edit text.
+\end{itemize}
+These shortcuts enhance usability for line editing, history access, and job control.
+
+\subsection{Feature-to-Commands Mapping}
+For reference, here is a mapping of features to their associated commands/shortcuts:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Command Execution (Pipelines, Redirections)}: External commands (e.g., \texttt{ls | grep foo > out.txt}), \texttt{echo}, \texttt{cd}, \texttt{pwd}.
+  \item \textbf{Interactive Mode \& PTY}: Automatic for single-stage commands like \texttt{vim}.
+  \item \textbf{Background Jobs}: \texttt{bgpids}, \texttt{killprocess}, Ctrl+Z (the '&' operator is not supported).
+  \item \textbf{multiWatch}: \texttt{multiWatch}, Ctrl+C (interrupt).
+  \item \textbf{Input Handling}: Multi-line with quotes/backslashes, semicolon/newline separation.
+  \item \textbf{History}: \texttt{history}.
+  \item \textbf{Signal Handling \& Cleanup}: Ctrl+C, Ctrl+Z.
+  \item \textbf{Rendering \& Output}: ANSI colors, \texttt{clear}, Ctrl+L.
+  \item \textbf{Temp Files \& Resource Management}: Automatic (FIFOs for multiWatch).
+  \item \textbf{Build \& Configuration}: \texttt{make}, \texttt{cmake}.
+  \item \textbf{UX Enhancements}: Separators, prompts, shortcuts.
+\end{itemize}
+
+\section{Autocomplete Feature}
+MyTerminal provides basic autocomplete functionality to assist users in entering commands and file paths efficiently.
+
+\subsection{Design}
+\begin{itemize}[leftmargin=*]
+  \item When the user presses the Tab key during input, the shell attempts to complete the current word.
+  \item If the word matches the prefix of a built-in command, external command, or file/directory in the current working directory, possible completions are suggested or inserted.
+  \item Directory-prefix-aware replacements are supported: typing a partial directory or file name and pressing Tab will complete or list matches.
+  \item For file name completion:
+    \begin{itemize}
+      \item If one file matches the prefix, complete the input with the full file name.
+      \item If multiple files match, complete to the longest common prefix if it extends the current input.
+      \item If multiple matches remain after prefix completion, display numbered options (e.g., 1. file1.txt 2. file2.txt) and prompt the user to select by number.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Implementation}
+\begin{itemize}[leftmargin=*]
+  \item The input handler scans the current input buffer for the word under the cursor.
+  \item Built-in commands are matched from a static list; external commands are matched from the system PATH.
+  \item File and directory matches are found using globbing in the current working directory.
+  \item The transcript is updated with suggestions if multiple matches are found; otherwise, the input buffer is updated with the completed word.
+\end{itemize}
+
+\subsection{Limitations}
+\begin{itemize}[leftmargin=*]
+  \item Autocomplete does not support advanced shell grammar (e.g., variable expansion, command substitution).
+  \item Only single-word completion is supported; multi-stage pipeline or quoted arguments may not autocomplete as expected.
+  \item No fuzzy matching; only prefix matches are considered.
+\end{itemize}
+
+\subsection{Usage}
+\begin{itemize}[leftmargin=*]
+  \item Press Tab while typing a command or file path to trigger autocomplete.
+  \item If multiple completions are possible, they will be listed in the transcript area.
+  \item Example: typing \texttt{ec} and pressing Tab will complete to \texttt{echo}.
+  \item Example: typing \texttt{test\_fi} and pressing Tab will complete to \texttt{test\_file.txt} if present in the directory.
+  \item Example (file completion): In a directory with files "abc.txt", "def.txt", "abcd.txt":
+    \begin{itemize}
+      \item Typing \texttt{./myprog de} and pressing Tab completes to \texttt{./myprog def.txt}.
+      \item Typing \texttt{./myprog abc} and pressing Tab displays "1. abc.txt 2. abcd.txt" and waits for user input (e.g., pressing 1 completes to \texttt{./myprog abc.txt}).
+    \end{itemize}
+\end{itemize}
+
+\section{Error Handling and Edge Cases}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Command not found}: prints \emph{command not found} with status 127
+  \item \textbf{Globbing}: expanded via \texttt{glob(3)}; tokens not matching become literals
+  \item \textbf{UTF-8 input}: Accepted via XIM/XIC; unrecognized control bytes are dropped
+  \item \textbf{PTY fallback}: If PTY allocation fails, falls back to pipe mode
+  \item \textbf{multiWatch FIFO races}: Reader open retries and nonblocking write open in child avoid ENXIO/ENOENT races
+\end{itemize}
+
+\section{Performance Considerations}
+\begin{itemize}[leftmargin=*]
+  \item Nonblocking I/O and short poll timeouts keep UI responsive.
+  \item \texttt{multiWatch} scales roughly O(N) in number of polled FIFOs; each poll loop is bounded and data is chunked.
+  \item PTY path is used for single-stage interactive commands to avoid line-buffering surprises and to support TTY-aware programs.
+\end{itemize}
+
+\section{Build and Configuration}
+Two build routes:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Make (with or without Pango/Cairo)}:
+\begin{lstlisting}[style=code]
+# With Pango/Cairo (default Makefile uses Pango)
+make -f Makefile
+make -f Makefile clean
+
+# Without Pango/Cairo
+make -f Makefile.nopango
+make -f Makefile.nopango clean
+\end{lstlisting}
+  \item \textbf{CMake}:
+\begin{lstlisting}[style=code]
+cmake -S . -B build -DUSE_PANGO_CAIRO=ON   # or OFF to disable Pango/Cairo
+cmake --build build
+\end{lstlisting}
+\end{itemize}
+For CMake builds, toggle Pango/Cairo via the cache option \texttt{-DUSE\_PANGO\_CAIRO=ON|OFF}.
+
+\subsection{Runtime Paths and Permissions}
+\begin{itemize}[leftmargin=*]
+  \item Temp FIFOs live under \texttt{temp/} with filenames \texttt{.temp.<PID>.txt}. Default mode 0644 is adequate for single-user project work; production-grade terminals should place temp under \texttt{/tmp/myterm-<uid>} with directory mode 0700 to avoid cross-user interference.
+  \item \texttt{umask} may affect FIFO file modes; code assumes a permissive default.
+\end{itemize}
+
+\section{Security Considerations}
+\begin{itemize}[leftmargin=*]
+  \item No shell escaping is performed beyond glob expansion; commands are executed via execvp or \texttt{sh -c} (in multiWatch). Treat input as untrusted.
+  \item Temp FIFOs are created under project \texttt{temp/}; production usage should prefer \texttt{/tmp/myterm-<uid>} with \texttt{0700} to avoid cross-user interference.
+  \item Signal handling avoids partial cleanup by unlinking known FIFOs and killing child PIDs on exit paths.
+\end{itemize}
+
+\section{Appendix: Key APIs}
+\subsection{TerminalWindow}
+\begin{lstlisting}[style=code]
+void run();
+void executeLine(const std::string& line);
+void executeLineInternal(const std::string& line, bool echoPromptAndCmd);
+void spawnProcess(const std::vector<std::string>& argv);
+void pumpChildOutput();
+void drainBackgroundJobs();
+void submitInputLine(Tab& t, bool triggerRedraw = true);
+void runNextCommand(Tab& t);
+static std::vector<std::string> splitArgs(const std::string& s);
+\end{lstlisting}
+
+\subsection{Tab}
+\begin{lstlisting}[style=code]
+std::deque<std::pair<std::string,bool>> pendingCmds;
+pid_t childPid, childPgid;
+int outFd, errFd, inFdWrite;
+bool watchActive;
+std::string savedScrollbackBeforeWatch;
+\end{lstlisting}
+
+\subsection{multiWatch (worker inner loop)}
+\begin{lstlisting}[style=code]
+// For each period:
+- Fork command children
+- Parent mkfifo temp/.temp.<PID>.txt and opens read end (nonblocking)
+- Child opens write end and dup2s stdout/stderr to it
+- Parent poll()s across all FIFO read fds:
+  - Print header, then separator, then stream data, then trailing separator
+- Close and unlink FIFO when done
+- Sleep interval seconds and repeat
+\end{lstlisting}
+\end{document}

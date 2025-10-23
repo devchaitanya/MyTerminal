@@ -1,0 +1,2 @@
+/usr/bin/ar qc libterminal_gui.a CMakeFiles/terminal_gui.dir/src/gui/TerminalWindow.cpp.o CMakeFiles/terminal_gui.dir/src/gui/Tab.cpp.o CMakeFiles/terminal_gui.dir/src/core/History.cpp.o
+/usr/bin/ranlib libterminal_gui.a

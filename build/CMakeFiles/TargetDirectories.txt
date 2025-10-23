@@ -1,0 +1,4 @@
+/home/chaitu/Desktop/vscode/MyTerminal/build/CMakeFiles/terminal_gui.dir
+/home/chaitu/Desktop/vscode/MyTerminal/build/CMakeFiles/myshell.dir
+/home/chaitu/Desktop/vscode/MyTerminal/build/CMakeFiles/edit_cache.dir
+/home/chaitu/Desktop/vscode/MyTerminal/build/CMakeFiles/rebuild_cache.dir

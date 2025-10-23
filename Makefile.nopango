@@ -1,0 +1,18 @@
+CXX = g++
+CXXFLAGS = -std=gnu++17 -Wall -Wextra -O2 -g
+LIBS = -lX11
+
+SRC = \
+	src/gui/TerminalWindow.cpp \
+	src/gui/Tab.cpp \
+	src/core/CommandExecutor.cpp \
+	src/core/History.cpp \
+	src/app/main.cpp
+
+INC = -Iinclude
+
+myshell: $(SRC)
+	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(INC) $(LIBS)
+
+clean:
+	rm -f myshell

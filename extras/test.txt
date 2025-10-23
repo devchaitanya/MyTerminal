@@ -1,0 +1,16 @@
+ls
+ls
+ls -la
+
+multiWatch ["echo chaitanya", "echo krishna"]
+
+echo "We say Hello in English \n
+हम हंदी में नमस्ते कहते हैं \n
+Aloha mākou ma ka ʻōlelo Hawaiʻi \n 
+मराठीत नमस्कार "
+
+
+echo "hello chaitanya
+how are you
+i am fine how are you"
+
